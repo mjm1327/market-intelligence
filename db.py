@@ -23,9 +23,14 @@ def init_db():
             type TEXT,
             title TEXT,
             raw_content TEXT,
+            summary TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    # Migrate existing DBs that predate the summary column
+    existing = [r[1] for r in c.execute("PRAGMA table_info(sources)").fetchall()]
+    if "summary" not in existing:
+        c.execute("ALTER TABLE sources ADD COLUMN summary TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS extracted_companies (
@@ -70,12 +75,12 @@ def init_db():
 
 # ── Sources ──────────────────────────────────────────────────────────────────
 
-def save_source(url, type_, title, raw_content):
+def save_source(url, type_, title, raw_content, summary=None):
     conn = get_connection()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO sources (url, type, title, raw_content) VALUES (?, ?, ?, ?)",
-        (url, type_, title, raw_content)
+        "INSERT INTO sources (url, type, title, raw_content, summary) VALUES (?, ?, ?, ?, ?)",
+        (url, type_, title, raw_content, summary)
     )
     source_id = c.lastrowid
     conn.commit()

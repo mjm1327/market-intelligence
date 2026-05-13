@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import db
-from extractors.llm import extract_companies
+from extractors.llm import extract_companies, parse_transcript_file, summarize_transcript
 from extractors.substack import get_substack_content
 from extractors.youtube import get_transcript
 from scanner.wma_scanner import get_cached_results, run_scan
@@ -171,8 +171,8 @@ page = st.sidebar.radio(
 if page == "Sources":
     st.title("Sources")
     st.caption(
-        "Add YouTube videos, Substack articles, or paste raw text. "
-        "Claude extracts the companies and AI themes."
+        "Add YouTube videos, Substack articles, upload transcript files (.txt/.srt/.vtt), or paste raw text. "
+        "Claude extracts companies and AI themes — uploaded transcripts also get a full investment summary."
     )
 
     add_tab, history_tab = st.tabs(["➕ Add Source", "📋 History"])
@@ -180,7 +180,7 @@ if page == "Sources":
     with add_tab:
         source_type = st.selectbox(
             "Source type",
-            ["YouTube Video", "Substack Article", "Paste Text"],
+            ["YouTube Video", "Substack Article", "Upload Transcript", "Paste Text"],
         )
 
         if source_type == "YouTube Video":
@@ -247,6 +247,49 @@ if page == "Sources":
                         status.update(label="Error", state="error")
                         st.error(str(e))
 
+        elif source_type == "Upload Transcript":
+            st.caption("Upload a transcript file (.txt, .srt, .vtt). Claude will summarize it and extract companies.")
+            title = st.text_input("Title", placeholder="e.g. My Macro Show — AI Infrastructure Deep Dive")
+            uploaded = st.file_uploader("Transcript file", type=["txt", "srt", "vtt"])
+            if st.button("Summarize & Extract", type="primary", disabled=not uploaded):
+                with st.status("Processing transcript…", expanded=True) as status:
+                    try:
+                        content = parse_transcript_file(uploaded.read(), uploaded.name)
+                        st.write(f"✅ Parsed ({len(content):,} chars)")
+
+                        st.write("Generating investment summary…")
+                        summary = summarize_transcript(content)
+
+                        st.write("Extracting companies…")
+                        companies = extract_companies(content)
+
+                        source_id = db.save_source(
+                            "",
+                            "transcript",
+                            title or uploaded.name,
+                            content,
+                            summary=summary,
+                        )
+                        db.save_extracted_companies(source_id, companies)
+                        status.update(
+                            label=f"Done — {len(companies)} companies found",
+                            state="complete",
+                        )
+
+                        st.markdown("### Summary")
+                        st.markdown(summary)
+
+                        if companies:
+                            st.markdown("### Companies Extracted")
+                            st.dataframe(
+                                _companies_df(companies),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                    except Exception as e:
+                        status.update(label="Error", state="error")
+                        st.error(str(e))
+
         else:  # Paste Text
             title = st.text_input(
                 "Title (optional)",
@@ -289,7 +332,12 @@ if page == "Sources":
                 with st.expander(label):
                     if src["url"]:
                         st.markdown(f"[Open source]({src['url']})")
+                    if src.get("summary"):
+                        st.markdown("**Summary**")
+                        st.markdown(src["summary"])
+                        st.markdown("---")
                     if companies:
+                        st.markdown("**Companies extracted**")
                         st.dataframe(
                             _companies_df(companies),
                             use_container_width=True,
