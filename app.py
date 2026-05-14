@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import db
+import massive_client
 from extractors.llm import extract_companies, parse_transcript_file, summarize_transcript
 from extractors.substack import get_substack_content
 from extractors.youtube import get_transcript
@@ -159,7 +160,7 @@ st.sidebar.title("📈 Market Intelligence")
 st.sidebar.markdown("---")
 page = st.sidebar.radio(
     "Navigate",
-    ["Sources", "Intelligence", "200 WMA Scanner", "Watchlist"],
+    ["Sources", "Intelligence", "200 WMA Scanner", "Watchlist", "Options"],
     label_visibility="collapsed",
 )
 
@@ -658,3 +659,315 @@ elif page == "Watchlist":
                     ):
                         db.remove_from_watchlist(selected_ticker)
                         st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE: OPTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif page == "Options":
+    st.title("Options")
+    st.caption(
+        "Analyze options chains for any ticker — IV skew, open interest concentration, "
+        "and strategy framing. Data via yfinance."
+    )
+
+    _OPT_COL_ORDER = ["strike", "expiration", "type", "lastPrice", "bid", "ask",
+                       "impliedVolatility", "volume", "openInterest", "delta",
+                       "inTheMoney"]
+    _OPT_COL_LABELS = {
+        "strike": "Strike", "expiration": "Expiry", "type": "Type",
+        "lastPrice": "Last", "bid": "Bid", "ask": "Ask",
+        "impliedVolatility": "IV", "volume": "Volume", "openInterest": "OI",
+        "delta": "Delta", "inTheMoney": "ITM",
+    }
+
+    @st.cache_data(ttl=300)
+    def _load_options(ticker: str):
+        """Fetch all expiry dates + option chains via yfinance. Cached 5 min."""
+        try:
+            tk = yf.Ticker(ticker)
+            exps = tk.options  # tuple of expiry date strings
+            if not exps:
+                return None, []
+            info = tk.fast_info
+            spot = getattr(info, "last_price", None) or getattr(info, "regularMarketPrice", None)
+            return spot, list(exps)
+        except Exception as e:
+            return None, []
+
+    @st.cache_data(ttl=300)
+    def _load_chain(ticker: str, expiry: str):
+        """Load calls + puts for a single expiry. Cached 5 min."""
+        tk = yf.Ticker(ticker)
+        chain = tk.option_chain(expiry)
+        calls = chain.calls.copy()
+        puts = chain.puts.copy()
+        calls["type"] = "call"
+        puts["type"] = "put"
+        calls["expiration"] = expiry
+        puts["expiration"] = expiry
+        return calls, puts
+
+    def _skew_table(calls: pd.DataFrame, puts: pd.DataFrame, spot: float) -> pd.DataFrame:
+        """
+        Build a skew comparison table at ±5%, ±10%, ±15% moneyness wings.
+        Returns a DataFrame with columns: Wing, Call IV, Put IV, Skew (C-P).
+        """
+        if spot is None or spot == 0:
+            return pd.DataFrame()
+
+        rows = []
+        for pct in [5, 10, 15]:
+            c_strike = spot * (1 + pct / 100)
+            p_strike = spot * (1 - pct / 100)
+
+            c_row = calls.iloc[(calls["strike"] - c_strike).abs().argsort()[:1]]
+            p_row = puts.iloc[(puts["strike"] - p_strike).abs().argsort()[:1]]
+
+            c_iv = c_row["impliedVolatility"].values[0] * 100 if not c_row.empty else None
+            p_iv = p_row["impliedVolatility"].values[0] * 100 if not p_row.empty else None
+
+            skew = round(c_iv - p_iv, 1) if (c_iv is not None and p_iv is not None) else None
+            rows.append({
+                "Wing": f"+{pct}% / -{pct}%",
+                "Call IV": f"{c_iv:.1f}%" if c_iv else "—",
+                "Put IV": f"{p_iv:.1f}%" if p_iv else "—",
+                "Skew (C−P)": f"{skew:+.1f}%" if skew is not None else "—",
+                "_skew_raw": skew,
+            })
+
+        return pd.DataFrame(rows)
+
+    def _top_oi(calls: pd.DataFrame, puts: pd.DataFrame, n: int = 10) -> pd.DataFrame:
+        """Return top-N strikes by combined open interest."""
+        combined = pd.concat([
+            calls[["strike", "openInterest", "type"]],
+            puts[["strike", "openInterest", "type"]],
+        ])
+        combined["openInterest"] = pd.to_numeric(combined["openInterest"], errors="coerce").fillna(0)
+        top = (
+            combined.groupby(["strike", "type"])["openInterest"]
+            .sum()
+            .reset_index()
+            .sort_values("openInterest", ascending=False)
+            .head(n)
+        )
+        top.columns = ["Strike", "Type", "Open Interest"]
+        return top.reset_index(drop=True)
+
+    def _strategy_framing(skew_df: pd.DataFrame, spot: float) -> str:
+        """Simple rule-based strategy hint based on skew direction."""
+        if skew_df.empty:
+            return "Not enough data to frame a strategy."
+        raw = [r for r in skew_df["_skew_raw"].tolist() if r is not None]
+        if not raw:
+            return "Not enough data to frame a strategy."
+        avg_skew = sum(raw) / len(raw)
+        if avg_skew > 3:
+            return (
+                "📈 **Positive call skew detected** — calls are relatively expensive vs puts. "
+                "Consider **selling OTM calls** (covered call / call spread) or **buying OTM puts** "
+                "to take advantage of elevated call premium. Avoid buying naked calls."
+            )
+        elif avg_skew < -3:
+            return (
+                "📉 **Positive put skew detected** — puts are relatively expensive vs calls. "
+                "Classic fear premium. Consider **selling OTM puts** (cash-secured or put spread) "
+                "to collect elevated put premium. Avoid buying naked puts."
+            )
+        else:
+            return (
+                "⚖️ **Skew is relatively flat** — calls and puts are priced similarly. "
+                "Straddles or strangles may offer balanced risk/reward. "
+                "No strong directional vol edge from skew alone."
+            )
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    inp_col, _ = st.columns([2, 3])
+    with inp_col:
+        opt_ticker = st.text_input(
+            "Ticker", value="SPY", placeholder="e.g. NVDA, SLV, QQQ"
+        ).upper().strip()
+
+    if not opt_ticker:
+        st.stop()
+
+    spot, exps = _load_options(opt_ticker)
+
+    if not exps:
+        st.error(f"No options data found for **{opt_ticker}**. Check the ticker and try again.")
+        st.stop()
+
+    # Show spot price
+    if spot:
+        st.markdown(f"**{opt_ticker}** spot price: **${spot:,.2f}**")
+
+    # Expiry selector — default to ~30-45 DTE
+    from datetime import date, datetime
+
+    today = date.today()
+    exp_dates = []
+    for e in exps:
+        try:
+            exp_dates.append(datetime.strptime(e, "%Y-%m-%d").date())
+        except ValueError:
+            pass
+
+    # Find default expiry closest to 35 DTE
+    if exp_dates:
+        target_dte = 35
+        default_exp = min(exp_dates, key=lambda d: abs((d - today).days - target_dte))
+        default_idx = exp_dates.index(default_exp)
+    else:
+        default_idx = 0
+
+    sel_exp = st.selectbox(
+        "Expiry",
+        exps,
+        index=default_idx,
+        help="Select an expiration date. Default is closest to 35 DTE.",
+    )
+
+    sel_date = datetime.strptime(sel_exp, "%Y-%m-%d").date()
+    dte = (sel_date - today).days
+    st.caption(f"{dte} days to expiration")
+
+    # Load chain
+    with st.spinner("Loading options chain…"):
+        calls, puts = _load_chain(opt_ticker, sel_exp)
+
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+
+    skew_tab, chain_tab, oi_tab, ref_tab = st.tabs(
+        ["📐 IV Skew", "📋 Chain", "🏔 OI Concentration", "📁 Reference Data"]
+    )
+
+    with skew_tab:
+        st.subheader("Implied Volatility Skew")
+        if spot:
+            skew_df = _skew_table(calls, puts, spot)
+            if not skew_df.empty:
+                disp_skew = skew_df.drop(columns=["_skew_raw"])
+                st.dataframe(disp_skew, use_container_width=False, hide_index=True)
+
+                # Skew bar chart
+                wings = skew_df["Wing"].tolist()
+                raw_vals = skew_df["_skew_raw"].tolist()
+                colors = ["#e63946" if v and v > 0 else "#2a9d8f" for v in raw_vals]
+
+                fig_skew = go.Figure(go.Bar(
+                    x=wings,
+                    y=[v if v is not None else 0 for v in raw_vals],
+                    marker_color=colors,
+                    text=[f"{v:+.1f}%" if v is not None else "—" for v in raw_vals],
+                    textposition="outside",
+                ))
+                fig_skew.update_layout(
+                    title="Call IV minus Put IV by wing (positive = calls richer)",
+                    yaxis_title="Skew (pp)",
+                    xaxis_title="Moneyness wing",
+                    height=320,
+                    margin={"t": 50, "b": 40},
+                )
+                st.plotly_chart(fig_skew, use_container_width=True)
+
+                st.markdown("### Strategy Framing")
+                st.markdown(_strategy_framing(skew_df, spot))
+            else:
+                st.info("Could not compute skew — not enough strikes around spot.")
+        else:
+            st.info("Spot price unavailable — skew analysis requires spot.")
+
+    with chain_tab:
+        st.subheader("Full Options Chain")
+        view = st.radio("Show", ["Calls", "Puts", "Both"], horizontal=True)
+
+        def _prep_chain(df: pd.DataFrame) -> pd.DataFrame:
+            out = df.copy()
+            if "impliedVolatility" in out.columns:
+                out["impliedVolatility"] = (out["impliedVolatility"] * 100).round(1).astype(str) + "%"
+            disp_cols = [c for c in _OPT_COL_ORDER if c in out.columns]
+            out = out[disp_cols].rename(columns=_OPT_COL_LABELS)
+            return out
+
+        if view in ("Calls", "Both"):
+            st.markdown("**Calls**")
+            st.dataframe(_prep_chain(calls), use_container_width=True, hide_index=True)
+        if view in ("Puts", "Both"):
+            st.markdown("**Puts**")
+            st.dataframe(_prep_chain(puts), use_container_width=True, hide_index=True)
+
+    with oi_tab:
+        st.subheader("Open Interest Concentration")
+        top_oi = _top_oi(calls, puts, n=15)
+        if top_oi.empty:
+            st.info("No OI data available.")
+        else:
+            # Color calls vs puts
+            call_mask = top_oi["Type"] == "call"
+            bar_colors = ["#4c9be8" if c else "#f4845f" for c in call_mask]
+
+            fig_oi = go.Figure(go.Bar(
+                x=top_oi["Strike"].astype(str) + " " + top_oi["Type"],
+                y=top_oi["Open Interest"],
+                marker_color=bar_colors,
+                text=top_oi["Open Interest"].apply(lambda x: f"{x:,.0f}"),
+                textposition="outside",
+            ))
+            fig_oi.update_layout(
+                title=f"Top OI strikes — {opt_ticker} {sel_exp}",
+                xaxis_title="Strike + Type",
+                yaxis_title="Open Interest",
+                height=380,
+                margin={"t": 50, "b": 60},
+            )
+            st.plotly_chart(fig_oi, use_container_width=True)
+
+            st.dataframe(top_oi, use_container_width=False, hide_index=True)
+
+            # Max pain estimate: strike where total option loss is minimized
+            all_strikes = sorted(
+                set(calls["strike"].tolist() + puts["strike"].tolist())
+            )
+            if all_strikes and len(calls) and len(puts):
+                pain = {}
+                for s in all_strikes:
+                    call_loss = float(
+                        calls.apply(
+                            lambda r: max(0, s - r["strike"]) * r["openInterest"], axis=1
+                        ).sum()
+                    )
+                    put_loss = float(
+                        puts.apply(
+                            lambda r: max(0, r["strike"] - s) * r["openInterest"], axis=1
+                        ).sum()
+                    )
+                    pain[s] = call_loss + put_loss
+                max_pain_strike = min(pain, key=pain.get)
+                st.metric(
+                    "Estimated Max Pain",
+                    f"${max_pain_strike:,.2f}",
+                    help="Strike where aggregate option-holder losses are minimized at expiry.",
+                )
+
+    with ref_tab:
+        st.subheader("Massive Reference Data")
+        st.caption(
+            "Option contract metadata from the Massive Market Data API (free tier). "
+            "Live greeks and snapshots require a paid plan."
+        )
+        if st.button("Load contract reference data", key="load_massive"):
+            with st.spinner("Fetching from Massive API…"):
+                try:
+                    contracts = massive_client.get_option_contracts(opt_ticker, limit=50)
+                    if contracts:
+                        df_contracts = pd.DataFrame(contracts)
+                        st.dataframe(df_contracts, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No contract reference data returned for this ticker.")
+                except massive_client.MassiveUpgradeRequired as e:
+                    st.warning(str(e))
+                except Exception as e:
+                    st.error(f"Massive API error: {e}")
