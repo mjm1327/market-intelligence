@@ -955,19 +955,88 @@ elif page == "Options":
     with ref_tab:
         st.subheader("Massive Reference Data")
         st.caption(
-            "Option contract metadata from the Massive Market Data API (free tier). "
-            "Live greeks and snapshots require a paid plan."
+            "Ticker metadata, dividend history, and option contract specs from the "
+            "Massive Market Data API (Basic/free tier). Live greeks and snapshots "
+            "require a paid plan."
         )
-        if st.button("Load contract reference data", key="load_massive"):
+
+        def _massive_section(label: str, fn, *args, **kwargs):
+            """Run a Massive API call and render the result, handling errors cleanly."""
+            try:
+                data = fn(*args, **kwargs)
+                return data
+            except massive_client.MassiveUpgradeRequired as e:
+                st.warning(f"⚠️ {e}")
+                return None
+            except Exception as e:
+                st.error(f"Massive API error ({label}): {e}")
+                return None
+
+        if st.button("Load reference data", key="load_massive"):
             with st.spinner("Fetching from Massive API…"):
-                try:
-                    contracts = massive_client.get_option_contracts(opt_ticker, limit=50)
-                    if contracts:
-                        df_contracts = pd.DataFrame(contracts)
-                        st.dataframe(df_contracts, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("No contract reference data returned for this ticker.")
-                except massive_client.MassiveUpgradeRequired as e:
-                    st.warning(str(e))
-                except Exception as e:
-                    st.error(f"Massive API error: {e}")
+
+                # ── 1. Ticker detail ─────────────────────────────────────────
+                st.markdown("#### Ticker Metadata")
+                detail = _massive_section("ticker detail", massive_client.get_ticker_detail, opt_ticker)
+                if detail:
+                    # Flatten one level of nesting for display
+                    flat = {}
+                    for k, v in detail.items():
+                        if isinstance(v, dict):
+                            for sk, sv in v.items():
+                                flat[f"{k}.{sk}"] = sv
+                        else:
+                            flat[k] = v
+                    meta_df = pd.DataFrame([flat]).T.reset_index()
+                    meta_df.columns = ["Field", "Value"]
+                    st.dataframe(meta_df, use_container_width=False, hide_index=True)
+                else:
+                    st.info("No ticker detail returned.")
+
+                st.markdown("---")
+
+                # ── 2. Dividend history ──────────────────────────────────────
+                st.markdown("#### Dividend History")
+                divs = _massive_section("dividends", massive_client.get_dividends, opt_ticker, limit=10)
+                if divs:
+                    df_divs = pd.DataFrame(divs)
+                    # Surface the most useful columns first if they exist
+                    priority_cols = ["ex_dividend_date", "pay_date", "cash_amount", "frequency", "currency"]
+                    ordered = [c for c in priority_cols if c in df_divs.columns]
+                    rest = [c for c in df_divs.columns if c not in ordered]
+                    st.dataframe(df_divs[ordered + rest], use_container_width=True, hide_index=True)
+                elif divs is not None:
+                    st.info("No dividend history for this ticker.")
+
+                st.markdown("---")
+
+                # ── 3. Option contract specs ─────────────────────────────────
+                st.markdown("#### Option Contract Specs")
+                st.caption("Reference contract data — strike, expiry, type, multiplier. Not live greeks.")
+                contracts = _massive_section(
+                    "option contracts",
+                    massive_client.get_option_contracts,
+                    opt_ticker,
+                    limit=50,
+                )
+                if contracts:
+                    df_contracts = pd.DataFrame(contracts)
+                    # Prioritise readable columns
+                    priority_cols = [
+                        "ticker", "underlying_ticker", "expiration_date",
+                        "strike_price", "contract_type", "shares_per_contract",
+                        "exercise_style", "primary_exchange",
+                    ]
+                    ordered = [c for c in priority_cols if c in df_contracts.columns]
+                    rest = [c for c in df_contracts.columns if c not in ordered]
+                    st.dataframe(
+                        df_contracts[ordered + rest],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.caption(
+                        f"{len(df_contracts)} contracts shown (max 50). "
+                        "Upgrade to Massive Starter ($29/mo) for live greeks."
+                    )
+                elif contracts is not None:
+                    st.info("No option contract data returned for this ticker.")
